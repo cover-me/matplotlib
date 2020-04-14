@@ -654,134 +654,118 @@ class RendererSVG(RendererBase):
         self._path_collection_id += 1
 
     def draw_gouraud_triangle(self, gc, points, colors, trans):
-        # docstring inherited
-
-        # This uses a method described here:
-        #
-        #   http://www.svgopen.org/2005/papers/Converting3DFaceToSVG/index.html
-        #
-        # that uses three overlapping linear gradients to simulate a
-        # Gouraud triangle.  Each gradient goes from fully opaque in
-        # one corner to fully transparent along the opposite edge.
-        # The line between the stop points is perpendicular to the
-        # opposite edge.  Underlying these three gradients is a solid
-        # triangle whose color is the average of all three points.
-
+        # Find linear interpolations for RGB channels
+        
         writer = self.writer
-        if not self._has_gouraud:
-            self._has_gouraud = True
-            writer.start(
-                'filter',
-                id='colorAdd')
-            writer.element(
-                'feComposite',
-                attrib={'in': 'SourceGraphic'},
-                in2='BackgroundImage',
-                operator='arithmetic',
-                k2="1", k3="1")
-            writer.end('filter')
-            # feColorMatrix filter to correct opacity
-            writer.start(
-                'filter',
-                id='colorMat')
-            writer.element(
-                'feColorMatrix',
-                attrib={'type': 'matrix'},
-                values='1 0 0 0 0 \n0 1 0 0 0 \n0 0 1 0 0' +
-                       ' \n1 1 1 1 0 \n0 0 0 0 1 ')
-            writer.end('filter')
-
-        avg_color = np.average(colors, axis=0)
-        if avg_color[-1] == 0:
-            # Skip fully-transparent triangles
+        avg_color = np.sum(colors[:, :], axis=0) / 3.0
+        # Just skip fully-transparent triangles
+        if avg_color[-1] == 0.0:
             return
 
         trans_and_flip = self._make_flip_transform(trans)
         tpoints = trans_and_flip.transform(points)
-
+        x1, y1 = tpoints[0]
+        x2, y2 = tpoints[1]
+        x3, y3 = tpoints[2]
+        
         writer.start('defs')
-        for i in range(3):
-            x1, y1 = tpoints[i]
-            x2, y2 = tpoints[(i + 1) % 3]
-            x3, y3 = tpoints[(i + 2) % 3]
-            rgba_color = colors[i]
-
-            if x2 == x3:
-                xb = x2
-                yb = y1
-            elif y2 == y3:
-                xb = x1
-                yb = y2
+        for i in range(4):
+            c1 = colors[0][i]
+            c2 = colors[1][i]
+            c3 = colors[2][i]
+            
+            if c1==c2 and c1==c3:     
+                if i==3:#alpha channel
+                    _ = [c1,c1,c1,0]
+                else:#rgb channel
+                    _ = [0,0,0,0]
+                    _[i] = c1
+                tri_attr = {'fill':rgb2hex(_)}
+                
+                if i==3:
+                    writer.start('mask',
+                                 id='GM%x'%self._n_gradients,
+                                 maskUnits='userSpaceOnUse',
+                                 x='0',y='0')
+                writer.element(
+                    'polygon',
+                    id='GT%x_%d' % (self._n_gradients, i),
+                    attrib=tri_attr,
+                    points=" ".join([short_float_fmt(x) 
+                                     for x in (x1, y1, x2, y2, x3, y3)]))
+                if i==3:
+                    writer.end('mask')
             else:
-                m1 = (y2 - y3) / (x2 - x3)
-                b1 = y2 - (m1 * x2)
-                m2 = -(1.0 / m1)
-                b2 = y1 - (m2 * x1)
-                xb = (-b1 + b2) / (m1 - m2)
-                yb = m2 * xb + b2
+                # find coefficients for c(x,y)=a1+a2*x+a3*y
+                a1,a2,a3 = np.dot(np.linalg.inv([[1,x1,y1],[1,x2,y2],[1,x3,y3]]),[c1,c2,c3])
 
-            writer.start(
-                'linearGradient',
-                id="GR%x_%d" % (self._n_gradients, i),
-                gradientUnits="userSpaceOnUse",
-                x1=short_float_fmt(x1), y1=short_float_fmt(y1),
-                x2=short_float_fmt(xb), y2=short_float_fmt(yb))
-            writer.element(
-                'stop',
-                offset='1',
-                style=generate_css({
-                    'stop-color': rgb2hex(avg_color),
-                    'stop-opacity': short_float_fmt(rgba_color[-1])}))
-            writer.element(
-                'stop',
-                offset='0',
-                style=generate_css({'stop-color': rgb2hex(rgba_color),
-                                    'stop-opacity': "0"}))
+                # find stop points for linearGradient,
+                # where c1=0 and c2=1, (x1,y1)=t0*(a2,a3),(x2,y2)=t1*(a2,a3)
+                c_x1,c_y1 = (-a1/(a2*a2+a3*a3))*np.array([a2,a3])
+                c_x2,c_y2 = ((1-a1)/(a2*a2+a3*a3))*np.array([a2,a3])       
 
-            writer.end('linearGradient')
+                writer.start(
+                    'linearGradient',
+                    id='GR%x_%d' % (self._n_gradients, i),
+                    gradientUnits='userSpaceOnUse',
+                    x1=short_float_fmt(c_x1), y1=short_float_fmt(c_y1),
+                    x2=short_float_fmt(c_x2), y2=short_float_fmt(c_y2))
+                writer.element(
+                    'stop',
+                    offset='0',
+                    attrib={'stop-color': '#000'})
+                c_hex = '#fff' if i==3 else '#'+'0'*i+'f'+'0'*(2-i)
+                writer.element(
+                    'stop',
+                    offset='1',
+                    attrib={'stop-color': c_hex}  )
+                writer.end('linearGradient')
+                
+                if i==3:
+                    writer.start('mask',
+                                 id='GM%x'%self._n_gradients,
+                                 maskUnits='userSpaceOnUse',
+                                 x='0',y='0')
+                writer.element(
+                    'polygon',
+                    id='GT%x_%d' % (self._n_gradients, i),
+                    fill='url(#GR%x_%d)'% (self._n_gradients, i),
+                    points=' '.join([short_float_fmt(x) 
+                                     for x in (x1, y1, x2, y2, x3, y3)]))
+                if i==3:
+                    writer.end('mask')
+
+        # filter
+        writer.start(
+            'filter',
+            filterUnits = 'userSpaceOnUse',
+            x = '0',
+            y = '0',
+            id='GF%x'%self._n_gradients),
+        for i in range(3):
+            writer.element(
+                'feImage',
+                attrib={'xlink:href':'#GT%x_%d' % (self._n_gradients, i)},
+                result='r%d'%i)
+        writer.element(
+            'feComposite',
+            attrib={'in': 'r0'},
+            in2='r1',
+            operator='arithmetic',
+            k2="1", k3="1")
+        writer.element(
+            'feComposite',
+            in2='r2',
+            operator='arithmetic',
+            k2="1", k3="1")
+        writer.end('filter')
 
         writer.end('defs')
 
-        # triangle formation using "path"
-        dpath = "M " + short_float_fmt(x1)+',' + short_float_fmt(y1)
-        dpath += " L " + short_float_fmt(x2) + ',' + short_float_fmt(y2)
-        dpath += " " + short_float_fmt(x3) + ',' + short_float_fmt(y3) + " Z"
-
         writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': rgb2hex(avg_color),
-                    'fill-opacity': '1',
-                    'shape-rendering': "crispEdges"})
-
-        writer.start(
-                'g',
-                attrib={'stroke': "none",
-                        'stroke-width': "0",
-                        'shape-rendering': "crispEdges",
-                        'filter': "url(#colorMat)"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_0)' % self._n_gradients,
-                    'shape-rendering': "crispEdges"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_1)' % self._n_gradients,
-                    'filter': 'url(#colorAdd)',
-                    'shape-rendering': "crispEdges"})
-
-        writer.element(
-            'path',
-            attrib={'d': dpath,
-                    'fill': 'url(#GR%x_2)' % self._n_gradients,
-                    'filter': 'url(#colorAdd)',
-                    'shape-rendering': "crispEdges"})
-
-        writer.end('g')
+            'use',
+            mask='url(#GM%x)' % (self._n_gradients),
+            attrib={'filter': 'url(#GF%x)'%self._n_gradients})
 
         self._n_gradients += 1
 
@@ -874,8 +858,6 @@ class RendererSVG(RendererBase):
 
             attrib['transform'] = generate_transform(
                 [('matrix', flipped.frozen())])
-            attrib['preserveAspectRatio'] = 'none'
-            attrib['style'] = 'image-rendering:pixelated'
             self.writer.element(
                 'image',
                 width=short_float_fmt(w), height=short_float_fmt(h),
